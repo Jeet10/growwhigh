@@ -7,7 +7,7 @@ import AuthScreen from '../features/ledger/components/AuthScreen'
 import DeletedHistoryModal from '../features/ledger/components/DeletedHistoryModal'
 import ProfileModal from '../features/ledger/components/ProfileModal'
 import ThemeSwitcher, { DEFAULT_THEME, isValidTheme } from '../features/ledger/components/ThemeSwitcher'
-import { fetchDeletedTransactions, fetchMembers, fetchRestoreEvents, fetchTransactions } from '../features/ledger/services/ledgerService'
+import { fetchDeletedTransactions, fetchMembers, fetchRestoreEvents, fetchTransactions, fetchLedgerSummary } from '../features/ledger/services/ledgerService'
 import { downloadFilteredExcel, downloadFilteredPdf } from '../features/ledger/utils/exportUtils'
 import {
   datePresetOptions,
@@ -23,6 +23,8 @@ import {
   toUTCString,
   typeFilterOptions,
 } from '../features/ledger/utils/ledgerUtils'
+
+const PAGE_SIZE = 200;
 
 export default function Home() {
   const [theme, setTheme] = useState(() => {
@@ -41,6 +43,24 @@ export default function Home() {
   const [authLoading, setAuthLoading] = useState(true)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+
+  // Pagination States
+  const [transactionsOffset, setTransactionsOffset] = useState(0)
+  const [totalTransactionsCount, setTotalTransactionsCount] = useState(0)
+  const [loadingMoreTransactions, setLoadingMoreTransactions] = useState(false)
+
+  const [deletedOffset, setDeletedOffset] = useState(0)
+  const [totalDeletedCount, setTotalDeletedCount] = useState(0)
+  const [loadingMoreDeleted, setLoadingMoreDeleted] = useState(false)
+
+  // 100% Accurate Global Summary State
+  const [summary, setSummary] = useState({
+    totalIn: 0,
+    totalOut: 0,
+    currentBalance: 0,
+    openingBalance: 0,
+    transactionCount: 0,
+  })
 
   const [allTransactions, setAllTransactions] = useState([])
   const [deletedTransactions, setDeletedTransactions] = useState([])
@@ -111,7 +131,6 @@ export default function Home() {
     }
   }, [])
 
-  // Load org logo when session changes
   useEffect(() => {
     if (!session?.user?.id) {
       setOrgLogoUrl(null)
@@ -125,10 +144,8 @@ export default function Home() {
         .from('org-logos')
         .getPublicUrl(fileName)
       
-      // Add a timestamp to bypass cache
       const cacheBustedUrl = `${publicUrl}?t=${Date.now()}`
       
-      // Check if the file actually exists by trying to fetch it
       try {
         const response = await fetch(cacheBustedUrl, { 
           method: 'HEAD',
@@ -205,39 +222,99 @@ export default function Home() {
 
   const loadWorkspace = async userId => {
     setLoading(true)
-    await Promise.all([loadTransactions(userId), loadDeletedTransactions(userId), loadRestoreEvents(userId), loadMembers(userId)])
+    await Promise.all([
+      loadTransactions(userId, false), 
+      loadDeletedTransactions(userId, false), 
+      loadRestoreEvents(userId), 
+      loadMembers(userId)
+    ])
     setLoading(false)
   }
 
-  const loadTransactions = async userId => {
-    const { data, error: queryError } = await fetchTransactions(userId)
-
-    if (queryError) {
-      handleError('Unable to load transactions. Check your Supabase tables and policies.')
-      setAllTransactions([])
-      return
+  const loadTransactions = async (userId, isLoadMore = false) => {
+    if (isLoadMore) setLoadingMoreTransactions(true)
+    else setLoading(true)
+    
+    const newOffset = isLoadMore ? transactionsOffset + PAGE_SIZE : 0;
+    
+    const currentFilters = {
+      type: filterTransactionType,
+      memberName: filterMemberName,
+      noteSearch: filterNote,
+      ...getDatePresetRange(filterDatePreset, filterStartDate, filterEndDate)
     }
 
-    setAllTransactions((data || []).map(normalizeTransaction))
+    try {
+      // 1. Fetch Paginated Transactions
+      const { data, count, error: queryError } = await fetchTransactions(userId, newOffset, newOffset + PAGE_SIZE - 1, currentFilters)
+
+      if (queryError) {
+        handleError('Unable to load transactions.')
+        if (!isLoadMore) setAllTransactions([])
+      } else {
+        const normalized = (data || []).map(normalizeTransaction)
+        if (isLoadMore) {
+          setAllTransactions(prev => [...prev, ...normalized])
+        } else {
+          setAllTransactions(normalized)
+        }
+        setTransactionsOffset(newOffset)
+        if (count !== null) setTotalTransactionsCount(count)
+      }
+
+      // 2. Fetch True Global Summary (only needed on fresh loads)
+      if (!isLoadMore) {
+        const summaryData = await fetchLedgerSummary(userId, currentFilters);
+        if (summaryData) setSummary(summaryData);
+      }
+    } catch (err) {
+      console.error(err);
+      handleError('Error fetching data.');
+    } finally {
+      if (isLoadMore) setLoadingMoreTransactions(false)
+      else setLoading(false)
+    }
   }
 
-  const loadDeletedTransactions = async userId => {
-    const { data, error: queryError } = await fetchDeletedTransactions(userId)
+  // Trigger search when filters change
+  useEffect(() => {
+    if (!session?.user?.id) return;
+    
+    const delayDebounceFn = setTimeout(() => {
+      loadTransactions(session.user.id, false);
+    }, 300);
+
+    return () => clearTimeout(delayDebounceFn);
+  }, [filterDatePreset, filterStartDate, filterEndDate, filterNote, filterMemberName, filterTransactionType])
+
+  const loadDeletedTransactions = async (userId, isLoadMore = false) => {
+    if (isLoadMore) setLoadingMoreDeleted(true)
+
+    const newOffset = isLoadMore ? deletedOffset + PAGE_SIZE : 0;
+    const { data, count, error: queryError } = await fetchDeletedTransactions(userId, newOffset, newOffset + PAGE_SIZE - 1)
 
     if (queryError) {
-      handleError('Unable to load deleted transaction history. Run the latest transaction archive SQL first.')
-      setDeletedTransactions([])
-      return
+      handleError('Unable to load deleted transaction history.')
+      if (!isLoadMore) setDeletedTransactions([])
+    } else {
+      const normalized = (data || []).map(normalizeTransaction)
+      if (isLoadMore) {
+        setDeletedTransactions(prev => [...prev, ...normalized])
+      } else {
+        setDeletedTransactions(normalized)
+      }
+      setDeletedOffset(newOffset)
+      if (count !== null) setTotalDeletedCount(count)
     }
-
-    setDeletedTransactions((data || []).map(normalizeTransaction))
+    
+    if (isLoadMore) setLoadingMoreDeleted(false)
   }
 
   const loadRestoreEvents = async userId => {
     const { data, error: queryError } = await fetchRestoreEvents(userId)
 
     if (queryError) {
-      handleError('Unable to load restore activity. Run the latest transaction archive SQL first.')
+      handleError('Unable to load restore activity.')
       setRestoreEvents([])
       return
     }
@@ -262,35 +339,9 @@ export default function Home() {
     })
   }
 
-  const filteredTransactions = useMemo(() => {
-    const { startDate, endDate } = getDatePresetRange(filterDatePreset, filterStartDate, filterEndDate)
-
-    return allTransactions.filter(transaction => {
-      const transactionDate = new Date(transaction.transaction_date || transaction.created_at)
-
-      if (startDate && transactionDate < startDate) return false
-      if (endDate && transactionDate > endDate) return false
-
-      if (filterTransactionType !== 'all' && transaction.type !== filterTransactionType) {
-        return false
-      }
-
-      if (filterMemberName !== 'all' && transaction.member_name !== filterMemberName) {
-        return false
-      }
-
-      if (filterNote) {
-        const noteValue = transaction.note?.toLowerCase() || ''
-        if (!noteValue.includes(filterNote.toLowerCase())) return false
-      }
-
-      return true
-    })
-  }, [allTransactions, filterDatePreset, filterEndDate, filterMemberName, filterNote, filterStartDate, filterTransactionType])
-
   const visibleTransactionIds = useMemo(
-    () => filteredTransactions.map(transaction => transaction.id),
-    [filteredTransactions]
+    () => allTransactions.map(transaction => transaction.id),
+    [allTransactions]
   )
   const selectedVisibleTransactionIds = useMemo(
     () => visibleTransactionIds.filter(transactionId => selectedTransactionIds.includes(transactionId)),
@@ -298,6 +349,7 @@ export default function Home() {
   )
   const allVisibleTransactionsSelected =
     visibleTransactionIds.length > 0 && selectedVisibleTransactionIds.length === visibleTransactionIds.length
+  
   const visibleDeletedTransactionIds = useMemo(
     () => deletedTransactions.map(transaction => transaction.id),
     [deletedTransactions]
@@ -321,34 +373,6 @@ export default function Home() {
       currentIds.filter(transactionId => activeDeletedTransactionIds.has(transactionId))
     )
   }, [deletedTransactions])
-
-  const summary = useMemo(() => {
-    const totalIn = filteredTransactions
-      .filter(transaction => transaction.type === 'in')
-      .reduce((sum, transaction) => sum + transaction.amount, 0)
-
-    const totalOut = filteredTransactions
-      .filter(transaction => transaction.type === 'out')
-      .reduce((sum, transaction) => sum + transaction.amount, 0)
-
-    const { startDate } = getDatePresetRange(filterDatePreset, filterStartDate, filterEndDate)
-    let openingBalance = 0
-    if (startDate) {
-      openingBalance = allTransactions.reduce((sum, transaction) => {
-        const transactionDate = new Date(transaction.transaction_date || transaction.created_at)
-        if (transactionDate >= startDate) return sum
-        return sum + (transaction.type === 'in' ? transaction.amount : -transaction.amount)
-      }, 0)
-    }
-
-    return {
-      totalIn,
-      totalOut,
-      currentBalance: openingBalance + totalIn - totalOut,
-      openingBalance,
-      transactionCount: filteredTransactions.length,
-    }
-  }, [allTransactions, filterDatePreset, filterEndDate, filterStartDate, filteredTransactions])
 
   const activeFilterCount = [
     filterDatePreset !== 'all',
@@ -414,14 +438,14 @@ export default function Home() {
 
   const exportRows = useMemo(
     () =>
-      filteredTransactions.map(transaction => ({
+      allTransactions.map(transaction => ({
         type: transaction.type === 'in' ? 'Cash in' : 'Cash out',
         amount: formatMoney(transaction.amount),
         member: transaction.member_name || 'Unknown',
         date: formatDate(transaction.transaction_date || transaction.created_at),
         note: transaction.note || '-',
       })),
-    [filteredTransactions]
+    [allTransactions]
   )
 
   const handleDownloadFilteredExcel = () => {
@@ -610,7 +634,7 @@ export default function Home() {
     setAmount('')
     setNote('')
     setTransactionDate('')
-    await loadTransactions(session.user.id)
+    await loadTransactions(session.user.id, false)
   }
 
   const toggleTransactionSelection = transactionId => {
@@ -654,7 +678,7 @@ export default function Home() {
     }
 
     setSelectedTransactionIds(currentIds => currentIds.filter(transactionId => !uniqueTransactionIds.includes(transactionId)))
-    await Promise.all([loadTransactions(session.user.id), loadDeletedTransactions(session.user.id)])
+    await Promise.all([loadTransactions(session.user.id, false), loadDeletedTransactions(session.user.id, false)])
   }
 
   const deleteTransaction = async transactionId => {
@@ -743,7 +767,7 @@ export default function Home() {
     setSelectedDeletedTransactionIds(currentIds =>
       currentIds.filter(transactionId => !transactionsToRestore.some(transaction => transaction.id === transactionId))
     )
-    await Promise.all([loadTransactions(session.user.id), loadDeletedTransactions(session.user.id), loadRestoreEvents(session.user.id)])
+    await Promise.all([loadTransactions(session.user.id, false), loadDeletedTransactions(session.user.id, false), loadRestoreEvents(session.user.id)])
   }
 
   const toggleDeletedTransactionSelection = transactionId => {
@@ -825,13 +849,15 @@ export default function Home() {
     }
 
     setEditingTransaction(null)
-    await loadTransactions(session.user.id)
+    await loadTransactions(session.user.id, false)
   }
 
   const currentUser = session?.user
   const handleThemeChange = nextTheme => {
     if (isValidTheme(nextTheme)) setTheme(nextTheme)
   }
+
+  const hasMoreTransactions = allTransactions.length < totalTransactionsCount;
 
   if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
     return (
@@ -955,7 +981,7 @@ export default function Home() {
                     <polyline points="3 3 3 8 8 8" />
                     <path d="M12 7v5l3 2" />
                   </svg>
-                  <span>Deleted history {deletedTransactions.length > 0 ? `(${deletedTransactions.length})` : ''}</span>
+                  <span>Deleted history {totalDeletedCount > 0 ? `(${totalDeletedCount})` : ''}</span>
                 </span>
               </button>
             </div>
@@ -974,7 +1000,9 @@ export default function Home() {
           <div className="card">
             <h2>Cash balance</h2>
             <strong>{formatMoney(summary.currentBalance)}</strong>
-            <span className="badge">{summary.transactionCount} shown</span>
+            <span className="badge">
+              {summary.transactionCount} total records
+            </span>
           </div>
 
           <div className="card">
@@ -1094,7 +1122,7 @@ export default function Home() {
                   <div className="entry-filters-title">
                     <span className="entry-filters-kicker">Cashflow filters</span>
                     <div className="entry-filters-meta">
-                      <span className="badge subtle">{summary.transactionCount} shown</span>
+                      <span className="badge subtle">{summary.transactionCount} records found</span>
                       {activeFilterCount > 0 && (
                         <span className="badge accent-badge">{activeFilterCount} active</span>
                       )}
@@ -1225,7 +1253,7 @@ export default function Home() {
             <section className="card transactions-card">
               {loading ? (
                 <p className="muted">Loading transactions...</p>
-              ) : filteredTransactions.length === 0 ? (
+              ) : allTransactions.length === 0 ? (
                 <p className="muted">
                   {activeFilterCount > 0
                     ? 'No transactions matched the current filters.'
@@ -1244,7 +1272,7 @@ export default function Home() {
                         <span>Select all</span>
                       </label>
                       <span className="badge">{selectedVisibleTransactionIds.length} selected</span>
-                      <span className="badge">{filteredTransactions.length} shown</span>
+                      <span className="badge">{allTransactions.length} loaded</span>
                     </div>
                     <div className="bulk-action-buttons">
                       <button
@@ -1266,7 +1294,7 @@ export default function Home() {
                     <span>Actions</span>
                   </div>
                   <div className="table-body">
-                    {filteredTransactions.map(transaction => (
+                    {allTransactions.map(transaction => (
                       <div key={transaction.id} className="table-row">
                         <span className="transaction-type-cell">
                           <input
@@ -1301,6 +1329,20 @@ export default function Home() {
                         </span>
                       </div>
                     ))}
+                    {hasMoreTransactions && (
+                       <div style={{ padding: '24px 0 12px', textAlign: 'center' }}>
+                         <button 
+                            className="secondary" 
+                            style={{ borderRadius: '99px', padding: '10px 24px' }} 
+                            onClick={() => loadTransactions(session.user.id, true)} 
+                            disabled={loadingMoreTransactions}
+                          >
+                           {loadingMoreTransactions 
+                             ? 'Loading...' 
+                             : `Load older records (${allTransactions.length} of ${totalTransactionsCount} loaded)`}
+                         </button>
+                       </div>
+                    )}
                   </div>
                 </div>
               )}
